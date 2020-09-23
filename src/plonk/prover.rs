@@ -77,11 +77,10 @@ impl<C: CurveAffine> Proof<C> {
         }
 
         let domain = &srs.domain;
-        let mut meta = ConstraintSystem::default();
-        let config = ConcreteCircuit::configure(&mut meta);
+        let config = ConcreteCircuit::configure(&mut ConstraintSystem::default());
 
         let mut witness = WitnessCollection {
-            advice: vec![domain.empty_lagrange(); meta.num_advice_wires],
+            advice: vec![domain.empty_lagrange(); srs.cs.num_advice_wires],
             _marker: std::marker::PhantomData,
         };
 
@@ -116,7 +115,8 @@ impl<C: CurveAffine> Proof<C> {
             })
             .collect();
 
-        let aux_cosets: Vec<_> = meta
+        let aux_cosets: Vec<_> = srs
+            .cs
             .aux_queries
             .iter()
             .map(|&(wire, at)| {
@@ -153,7 +153,8 @@ impl<C: CurveAffine> Proof<C> {
             .map(|poly| domain.lagrange_to_coeff(poly))
             .collect();
 
-        let advice_cosets: Vec<_> = meta
+        let advice_cosets: Vec<_> = srs
+            .cs
             .advice_queries
             .iter()
             .map(|&(wire, at)| {
@@ -284,7 +285,7 @@ impl<C: CurveAffine> Proof<C> {
 
         // Evaluate the circuit using the custom gates provided
         let mut h_poly = domain.empty_extended();
-        for poly in meta.gates.iter() {
+        for poly in srs.cs.gates.iter() {
             h_poly = h_poly * x_2;
 
             let evaluation = poly.evaluate(
@@ -387,19 +388,22 @@ impl<C: CurveAffine> Proof<C> {
         let x_3: C::Scalar = get_challenge_scalar(Challenge(transcript.squeeze().get_lower_128()));
 
         // Evaluate polynomials at omega^i x_3
-        let advice_evals: Vec<_> = meta
+        let advice_evals: Vec<_> = srs
+            .cs
             .advice_queries
             .iter()
             .map(|&(wire, at)| eval_polynomial(&advice_polys[wire.0], domain.rotate_omega(x_3, at)))
             .collect();
 
-        let aux_evals: Vec<_> = meta
+        let aux_evals: Vec<_> = srs
+            .cs
             .aux_queries
             .iter()
             .map(|&(wire, at)| eval_polynomial(&aux_polys[wire.0], domain.rotate_omega(x_3, at)))
             .collect();
 
-        let fixed_evals: Vec<_> = meta
+        let fixed_evals: Vec<_> = srs
+            .cs
             .fixed_queries
             .iter()
             .map(|&(wire, at)| {
@@ -459,9 +463,9 @@ impl<C: CurveAffine> Proof<C> {
         // Collapse openings at same points together into single openings using
         // x_4 challenge.
         let mut q_polys: Vec<Option<Polynomial<C::Scalar, Coeff>>> =
-            vec![None; meta.rotations.len()];
-        let mut q_blinds = vec![Blind(C::Scalar::zero()); meta.rotations.len()];
-        let mut q_evals: Vec<_> = vec![C::Scalar::zero(); meta.rotations.len()];
+            vec![None; srs.cs.rotations.len()];
+        let mut q_blinds = vec![Blind(C::Scalar::zero()); srs.cs.rotations.len()];
+        let mut q_evals: Vec<_> = vec![C::Scalar::zero(); srs.cs.rotations.len()];
         {
             let mut accumulate =
                 |point_index: usize, new_poly: &Polynomial<_, Coeff>, blind, eval| {
@@ -485,8 +489,8 @@ impl<C: CurveAffine> Proof<C> {
                     q_evals[point_index] += &eval;
                 };
 
-            for (query_index, &(wire, ref at)) in meta.advice_queries.iter().enumerate() {
-                let point_index = (*meta.rotations.get(at).unwrap()).0;
+            for (query_index, &(wire, ref at)) in srs.cs.advice_queries.iter().enumerate() {
+                let point_index = (*srs.cs.rotations.get(at).unwrap()).0;
 
                 accumulate(
                     point_index,
@@ -496,8 +500,8 @@ impl<C: CurveAffine> Proof<C> {
                 );
             }
 
-            for (query_index, &(wire, ref at)) in meta.aux_queries.iter().enumerate() {
-                let point_index = (*meta.rotations.get(at).unwrap()).0;
+            for (query_index, &(wire, ref at)) in srs.cs.aux_queries.iter().enumerate() {
+                let point_index = (*srs.cs.rotations.get(at).unwrap()).0;
 
                 accumulate(
                     point_index,
@@ -507,8 +511,8 @@ impl<C: CurveAffine> Proof<C> {
                 );
             }
 
-            for (query_index, &(wire, ref at)) in meta.fixed_queries.iter().enumerate() {
-                let point_index = (*meta.rotations.get(at).unwrap()).0;
+            for (query_index, &(wire, ref at)) in srs.cs.fixed_queries.iter().enumerate() {
+                let point_index = (*srs.cs.rotations.get(at).unwrap()).0;
 
                 accumulate(
                     point_index,
@@ -519,7 +523,7 @@ impl<C: CurveAffine> Proof<C> {
             }
 
             // We query the h(X) polynomial at x_3
-            let current_index = (*meta.rotations.get(&Rotation::default()).unwrap()).0;
+            let current_index = (*srs.cs.rotations.get(&Rotation::default()).unwrap()).0;
             for ((h_poly, h_blind), h_eval) in h_pieces
                 .into_iter()
                 .zip(h_blinds.iter())
@@ -564,7 +568,7 @@ impl<C: CurveAffine> Proof<C> {
         let x_5: C::Scalar = get_challenge_scalar(Challenge(transcript.squeeze().get_lower_128()));
 
         let mut f_poly: Option<Polynomial<C::Scalar, Coeff>> = None;
-        for (&row, &point_index) in meta.rotations.iter() {
+        for (&row, &point_index) in srs.cs.rotations.iter() {
             let mut poly = q_polys[point_index.0].as_ref().unwrap().clone();
             let point = domain.rotate_omega(x_3, row);
             poly[0] -= &q_evals[point_index.0];
@@ -598,9 +602,9 @@ impl<C: CurveAffine> Proof<C> {
             let x_6: C::Scalar =
                 get_challenge_scalar(Challenge(transcript.squeeze().get_lower_128()));
 
-            let mut q_evals = vec![C::Scalar::zero(); meta.rotations.len()];
+            let mut q_evals = vec![C::Scalar::zero(); srs.cs.rotations.len()];
 
-            for (_, &point_index) in meta.rotations.iter() {
+            for (_, &point_index) in srs.cs.rotations.iter() {
                 q_evals[point_index.0] =
                     eval_polynomial(&q_polys[point_index.0].as_ref().unwrap(), x_6);
             }
@@ -618,7 +622,7 @@ impl<C: CurveAffine> Proof<C> {
 
             let mut f_blind_dup = f_blind.clone();
             let mut f_poly = f_poly.clone();
-            for (_, &point_index) in meta.rotations.iter() {
+            for (_, &point_index) in srs.cs.rotations.iter() {
                 f_blind_dup *= x_7;
                 f_blind_dup += q_blinds[point_index.0];
 
