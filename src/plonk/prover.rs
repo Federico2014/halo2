@@ -1,5 +1,8 @@
 use super::{
-    circuit::{AdviceWire, Assignment, Circuit, ConstraintSystem, FixedWire},
+    circuit::{
+        default_query_set, inv_query_set, AdviceWire, Assignment, Circuit, ConstraintSystem,
+        FixedWire,
+    },
     hash_point, Error, Proof, SRS,
 };
 use crate::arithmetic::{
@@ -459,13 +462,18 @@ impl<C: CurveAffine> Proof<C> {
         // Collapse openings at same points together into single openings using
         // x_4 challenge.
         let mut q_polys: Vec<Option<Polynomial<C::Scalar, Coeff>>> =
-            vec![None; meta.rotations.len()];
-        let mut q_blinds = vec![Blind(C::Scalar::zero()); meta.rotations.len()];
-        let mut q_evals: Vec<_> = vec![C::Scalar::zero(); meta.rotations.len()];
+            vec![None; srs.cs.query_sets.len()];
+        let mut q_blinds = vec![Blind(C::Scalar::zero()); srs.cs.query_sets.len()];
+        // A vector of vectors of evaluations for each query at each query set
+        let mut q_eval_sets: Vec<Vec<C::Scalar>> = vec![Vec::new(); srs.cs.query_sets.len()];
+        for (set_idx, query_set) in srs.cs.query_sets.iter().enumerate() {
+            q_eval_sets[set_idx] = vec![C::Scalar::zero(); query_set.len()];
+        }
+
         {
             let mut accumulate =
-                |point_index: usize, new_poly: &Polynomial<_, Coeff>, blind, eval| {
-                    q_polys[point_index]
+                |set_idx: usize, new_poly: &Polynomial<_, Coeff>, blind, evals: Vec<C::Scalar>| {
+                    q_polys[set_idx]
                         .as_mut()
                         .map(|poly| {
                             parallelize(poly, |q, start| {
@@ -476,56 +484,98 @@ impl<C: CurveAffine> Proof<C> {
                             });
                         })
                         .or_else(|| {
-                            q_polys[point_index] = Some(new_poly.clone());
+                            q_polys[set_idx] = Some(new_poly.clone());
                             Some(())
                         });
-                    q_blinds[point_index] *= x_4;
-                    q_blinds[point_index] += blind;
-                    q_evals[point_index] *= &x_4;
-                    q_evals[point_index] += &eval;
+                    q_blinds[set_idx] *= x_4;
+                    q_blinds[set_idx] += blind;
+                    for query_idx in 0..q_eval_sets[set_idx].len() {
+                        q_eval_sets[set_idx][query_idx] *= &x_4;
+                        q_eval_sets[set_idx][query_idx] += &evals[query_idx];
+                    }
                 };
 
-            for (query_index, &(wire, ref at)) in meta.advice_queries.iter().enumerate() {
-                let point_index = (*meta.rotations.get(at).unwrap()).0;
+            for (set_idx, query_set) in srs.cs.query_sets.iter().enumerate() {
+                // If advice wires were queried at this set
+                if let Some(advice_wires) = srs.cs.advice_query_sets.clone().get_mut(query_set) {
+                    for wire in advice_wires.iter() {
+                        let mut wire_evals = vec![C::Scalar::zero(); query_set.len()];
+                        for (query_idx, query) in query_set.iter().enumerate() {
+                            let advice_query_idx = srs
+                                .cs
+                                .query_existing_advice_index(*wire, (*query).0)
+                                .unwrap();
+                            wire_evals[query_idx] = advice_evals[advice_query_idx];
+                        }
+                        accumulate(
+                            set_idx,
+                            &advice_polys[wire.0],
+                            advice_blinds[wire.0],
+                            wire_evals,
+                        );
+                    }
+                }
 
-                accumulate(
-                    point_index,
-                    &advice_polys[wire.0],
-                    advice_blinds[wire.0],
-                    advice_evals[query_index],
-                );
+                // If aux wires were queried at this set
+                if let Some(aux_wires) = srs.cs.aux_query_sets.clone().get_mut(query_set) {
+                    for wire in aux_wires.iter() {
+                        let mut wire_evals = vec![C::Scalar::zero(); query_set.len()];
+                        for (query_idx, query) in query_set.iter().enumerate() {
+                            let aux_query_idx =
+                                srs.cs.query_existing_aux_index(*wire, (*query).0).unwrap();
+                            wire_evals[query_idx] = aux_evals[aux_query_idx];
+                        }
+                        accumulate(
+                            set_idx,
+                            &aux_polys[wire.0],
+                            Blind(C::Scalar::zero()),
+                            wire_evals,
+                        );
+                    }
+                }
+
+                // If fixed wires were queried at this set
+                if let Some(fixed_wires) = srs.cs.fixed_query_sets.clone().get_mut(query_set) {
+                    for wire in fixed_wires.iter() {
+                        let mut wire_evals = vec![C::Scalar::zero(); query_set.len()];
+                        for (query_idx, query) in query_set.iter().enumerate() {
+                            let fixed_query_idx = srs
+                                .cs
+                                .query_existing_fixed_index(*wire, (*query).0)
+                                .unwrap();
+                            wire_evals[query_idx] = fixed_evals[fixed_query_idx];
+                        }
+                        accumulate(
+                            set_idx,
+                            &srs.fixed_polys[wire.0],
+                            Blind::default(),
+                            wire_evals,
+                        );
+                    }
+                }
             }
 
-            for (query_index, &(wire, ref at)) in meta.aux_queries.iter().enumerate() {
-                let point_index = (*meta.rotations.get(at).unwrap()).0;
-
-                accumulate(
-                    point_index,
-                    &aux_polys[wire.0],
-                    Blind(C::Scalar::zero()),
-                    aux_evals[query_index],
-                );
-            }
-
-            for (query_index, &(wire, ref at)) in meta.fixed_queries.iter().enumerate() {
-                let point_index = (*meta.rotations.get(at).unwrap()).0;
-
-                accumulate(
-                    point_index,
-                    &srs.fixed_polys[wire.0],
-                    Blind::default(),
-                    fixed_evals[query_index],
-                );
-            }
+            let default_set_index = srs
+                .cs
+                .query_sets
+                .iter()
+                .position(|set| set == &default_query_set())
+                .unwrap();
+            let inv_set_index = srs
+                .cs
+                .query_sets
+                .iter()
+                .position(|set| set == &inv_query_set())
+                .unwrap();
 
             // We query the h(X) polynomial at x_3
-            let current_index = (*meta.rotations.get(&Rotation::default()).unwrap()).0;
             for ((h_poly, h_blind), h_eval) in h_pieces
+                .clone()
                 .into_iter()
                 .zip(h_blinds.iter())
                 .zip(h_evals.iter())
             {
-                accumulate(current_index, &h_poly, *h_blind, *h_eval);
+                accumulate(default_set_index, &h_poly, *h_blind, vec![*h_eval]);
             }
 
             // Handle permutation arguments, if any exist
@@ -536,7 +586,7 @@ impl<C: CurveAffine> Proof<C> {
                     .zip(permutation_product_blinds.iter())
                     .zip(permutation_product_evals.iter())
                 {
-                    accumulate(current_index, poly, *blind, *eval);
+                    accumulate(default_set_index, poly, *blind, vec![*eval]);
                 }
 
                 // Open permutation polynomial commitments at x_3
@@ -546,17 +596,16 @@ impl<C: CurveAffine> Proof<C> {
                     .zip(permutation_evals.iter())
                     .flat_map(|(polys, evals)| polys.iter().zip(evals.iter()))
                 {
-                    accumulate(current_index, poly, Blind::default(), *eval);
+                    accumulate(default_set_index, poly, Blind::default(), vec![*eval]);
                 }
 
-                let current_index = (*srs.cs.rotations.get(&Rotation(-1)).unwrap()).0;
                 // Open permutation product commitments at \omega^{-1} x_3
                 for ((poly, blind), eval) in permutation_product_polys
                     .iter()
                     .zip(permutation_product_blinds.iter())
                     .zip(permutation_product_inv_evals.iter())
                 {
-                    accumulate(current_index, poly, *blind, *eval);
+                    accumulate(inv_set_index, poly, *blind, vec![*eval]);
                 }
             }
         }
@@ -564,26 +613,28 @@ impl<C: CurveAffine> Proof<C> {
         let x_5: C::Scalar = get_challenge_scalar(Challenge(transcript.squeeze().get_lower_128()));
 
         let mut f_poly: Option<Polynomial<C::Scalar, Coeff>> = None;
-        for (&row, &point_index) in meta.rotations.iter() {
-            let mut poly = q_polys[point_index.0].as_ref().unwrap().clone();
-            let point = domain.rotate_omega(x_3, row);
-            poly[0] -= &q_evals[point_index.0];
-            // TODO: change kate_division interface?
-            let mut poly = kate_division(&poly[..], point);
-            poly.push(C::Scalar::zero());
-            let poly = domain.coeff_from_vec(poly);
+        for (set_idx, query_set) in srs.cs.query_sets.iter().enumerate() {
+            for (query_idx, &row) in query_set.iter().enumerate() {
+                let mut poly = q_polys[set_idx].as_ref().unwrap().clone();
+                poly[0] -= &q_eval_sets[set_idx][query_idx];
+                // TODO: change kate_division interface?
+                let point = domain.rotate_omega(x_3, row);
+                let mut poly = kate_division(&poly[..], point);
+                poly.push(C::Scalar::zero());
+                let poly = domain.coeff_from_vec(poly);
 
-            f_poly = f_poly
-                .map(|mut f_poly| {
-                    parallelize(&mut f_poly, |q, start| {
-                        for (q, a) in q.iter_mut().zip(poly[start..].iter()) {
-                            *q *= &x_5;
-                            *q += a;
-                        }
-                    });
-                    f_poly
-                })
-                .or_else(|| Some(poly));
+                f_poly = f_poly
+                    .map(|mut f_poly| {
+                        parallelize(&mut f_poly, |q, start| {
+                            for (q, a) in q.iter_mut().zip(poly[start..].iter()) {
+                                *q *= &x_5;
+                                *q += a;
+                            }
+                        });
+                        f_poly
+                    })
+                    .or_else(|| Some(poly));
+            }
         }
 
         let f_poly = f_poly.unwrap();
@@ -598,11 +649,10 @@ impl<C: CurveAffine> Proof<C> {
             let x_6: C::Scalar =
                 get_challenge_scalar(Challenge(transcript.squeeze().get_lower_128()));
 
-            let mut q_evals = vec![C::Scalar::zero(); meta.rotations.len()];
+            let mut q_evals = vec![C::Scalar::zero(); srs.cs.query_sets.len()];
 
-            for (_, &point_index) in meta.rotations.iter() {
-                q_evals[point_index.0] =
-                    eval_polynomial(&q_polys[point_index.0].as_ref().unwrap(), x_6);
+            for (set_idx, _) in srs.cs.query_sets.iter().enumerate() {
+                q_evals[set_idx] = eval_polynomial(&q_polys[set_idx].as_ref().unwrap(), x_6);
             }
 
             for eval in q_evals.iter() {
@@ -618,14 +668,14 @@ impl<C: CurveAffine> Proof<C> {
 
             let mut f_blind_dup = f_blind.clone();
             let mut f_poly = f_poly.clone();
-            for (_, &point_index) in meta.rotations.iter() {
+            for (set_idx, _) in srs.cs.query_sets.iter().enumerate() {
                 f_blind_dup *= x_7;
-                f_blind_dup += q_blinds[point_index.0];
+                f_blind_dup += q_blinds[set_idx];
 
                 parallelize(&mut f_poly, |f, start| {
                     for (f, a) in f
                         .iter_mut()
-                        .zip(q_polys[point_index.0].as_ref().unwrap()[start..].iter())
+                        .zip(q_polys[set_idx].as_ref().unwrap()[start..].iter())
                     {
                         *f *= &x_7;
                         *f += a;
