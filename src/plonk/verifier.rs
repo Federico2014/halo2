@@ -1,9 +1,9 @@
-use super::{hash_point, Error, Proof, SRS};
-use crate::arithmetic::{get_challenge_scalar, Challenge, CurveAffine, Field};
-use crate::poly::{
-    commitment::{Guard, Params, MSM},
-    Rotation,
+use super::{
+    circuit::{default_query_set, inv_query_set},
+    hash_point, Error, Proof, SRS,
 };
+use crate::arithmetic::{get_challenge_scalar, Challenge, CurveAffine, Field};
+use crate::poly::commitment::{Guard, Params, MSM};
 use crate::transcript::Hasher;
 
 impl<'a, C: CurveAffine> Proof<C> {
@@ -168,46 +168,82 @@ impl<'a, C: CurveAffine> Proof<C> {
 
         // Compress the commitments and expected evaluations at x_3 together
         // using the challenge x_4
-        let mut q_commitments: Vec<_> = vec![params.empty_msm(); srs.cs.rotations.len()];
-        let mut q_evals: Vec<_> = vec![C::Scalar::zero(); srs.cs.rotations.len()];
+        let mut q_commitments: Vec<_> = vec![params.empty_msm(); srs.cs.query_sets.len()];
+        let mut q_eval_sets: Vec<Vec<C::Scalar>> = vec![Vec::new(); srs.cs.query_sets.len()];
+        for (set_idx, query_set) in srs.cs.query_sets.iter().enumerate() {
+            q_eval_sets[set_idx] = vec![C::Scalar::zero(); query_set.len()];
+        }
+
         {
-            let mut accumulate = |point_index: usize, new_commitment, eval| {
-                q_commitments[point_index].scale(x_4);
-                q_commitments[point_index].add_term(C::Scalar::one(), new_commitment);
-                q_evals[point_index] *= &x_4;
-                q_evals[point_index] += &eval;
+            let mut accumulate = |set_idx: usize, new_commitment, evals: Vec<C::Scalar>| {
+                q_commitments[set_idx].scale(x_4);
+                q_commitments[set_idx].add_term(C::Scalar::one(), new_commitment);
+                for query_idx in 0..q_eval_sets[set_idx].len() {
+                    q_eval_sets[set_idx][query_idx] *= &x_4;
+                    q_eval_sets[set_idx][query_idx] += &evals[query_idx];
+                }
             };
 
-            for (query_index, &(wire, ref at)) in srs.cs.advice_queries.iter().enumerate() {
-                let point_index = (*srs.cs.rotations.get(at).unwrap()).0;
-                accumulate(
-                    point_index,
-                    self.advice_commitments[wire.0],
-                    self.advice_evals[query_index],
-                );
+            for (set_idx, query_set) in srs.cs.query_sets.iter().enumerate() {
+                // If advice wires were queried at this set
+                if let Some(advice_wires) = srs.cs.advice_query_sets.clone().get_mut(query_set) {
+                    for wire in advice_wires.iter() {
+                        let mut wire_evals = vec![C::Scalar::zero(); query_set.len()];
+                        for (query_idx, query) in query_set.iter().enumerate() {
+                            let advice_query_idx = srs
+                                .cs
+                                .query_existing_advice_index(*wire, (*query).0)
+                                .unwrap();
+                            wire_evals[query_idx] = self.advice_evals[advice_query_idx];
+                        }
+                        accumulate(set_idx, self.advice_commitments[wire.0], wire_evals);
+                    }
+                }
+
+                // If aux wires were queried at this set
+                if let Some(aux_wires) = srs.cs.aux_query_sets.clone().get_mut(query_set) {
+                    for wire in aux_wires.iter() {
+                        let mut wire_evals = vec![C::Scalar::zero(); query_set.len()];
+                        for (query_idx, query) in query_set.iter().enumerate() {
+                            let aux_query_idx =
+                                srs.cs.query_existing_aux_index(*wire, (*query).0).unwrap();
+                            wire_evals[query_idx] = self.aux_evals[aux_query_idx];
+                        }
+                        accumulate(set_idx, aux_commitments[wire.0], wire_evals);
+                    }
+                }
+
+                // If fixed wires were queried at this set
+                if let Some(fixed_wires) = srs.cs.fixed_query_sets.clone().get_mut(query_set) {
+                    for wire in fixed_wires.iter() {
+                        let mut wire_evals = vec![C::Scalar::zero(); query_set.len()];
+                        for (query_idx, query) in query_set.iter().enumerate() {
+                            let fixed_query_idx = srs
+                                .cs
+                                .query_existing_fixed_index(*wire, (*query).0)
+                                .unwrap();
+                            wire_evals[query_idx] = self.fixed_evals[fixed_query_idx];
+                        }
+                        accumulate(set_idx, srs.fixed_commitments[wire.0], wire_evals);
+                    }
+                }
             }
 
-            for (query_index, &(wire, ref at)) in srs.cs.aux_queries.iter().enumerate() {
-                let point_index = (*srs.cs.rotations.get(at).unwrap()).0;
-                accumulate(
-                    point_index,
-                    aux_commitments[wire.0],
-                    self.aux_evals[query_index],
-                );
-            }
+            let default_set_index = srs
+                .cs
+                .query_sets
+                .iter()
+                .position(|set| set == &default_query_set())
+                .unwrap();
+            let inv_set_index = srs
+                .cs
+                .query_sets
+                .iter()
+                .position(|set| set == &inv_query_set())
+                .unwrap();
 
-            for (query_index, &(wire, ref at)) in srs.cs.fixed_queries.iter().enumerate() {
-                let point_index = (*srs.cs.rotations.get(at).unwrap()).0;
-                accumulate(
-                    point_index,
-                    srs.fixed_commitments[wire.0],
-                    self.fixed_evals[query_index],
-                );
-            }
-
-            let current_index = (*srs.cs.rotations.get(&Rotation::default()).unwrap()).0;
             for (commitment, eval) in self.h_commitments.iter().zip(self.h_evals.iter()) {
-                accumulate(current_index, *commitment, *eval);
+                accumulate(default_set_index, *commitment, vec![*eval]);
             }
 
             // Handle permutation arguments, if any exist
@@ -218,7 +254,7 @@ impl<'a, C: CurveAffine> Proof<C> {
                     .iter()
                     .zip(self.permutation_product_evals.iter())
                 {
-                    accumulate(current_index, *commitment, *eval);
+                    accumulate(default_set_index, *commitment, vec![*eval]);
                 }
                 // Open permutation commitments for each permutation argument at x_3
                 for (commitment, eval) in srs
@@ -227,16 +263,15 @@ impl<'a, C: CurveAffine> Proof<C> {
                     .zip(self.permutation_evals.iter())
                     .flat_map(|(commitments, evals)| commitments.iter().zip(evals.iter()))
                 {
-                    accumulate(current_index, *commitment, *eval);
+                    accumulate(default_set_index, *commitment, vec![*eval]);
                 }
-                let current_index = (*srs.cs.rotations.get(&Rotation(-1)).unwrap()).0;
                 // Open permutation product commitments at \omega^{-1} x_3
                 for (commitment, eval) in self
                     .permutation_product_commitments
                     .iter()
                     .zip(self.permutation_product_inv_evals.iter())
                 {
-                    accumulate(current_index, *commitment, *eval);
+                    accumulate(inv_set_index, *commitment, vec![*eval]);
                 }
             }
         }
@@ -263,15 +298,15 @@ impl<'a, C: CurveAffine> Proof<C> {
         // We can compute the expected msm_eval at x_6 using the q_evals provided
         // by the prover and from x_5
         let mut msm_eval = C::Scalar::zero();
-        for (&row, point_index) in srs.cs.rotations.iter() {
-            let mut eval = self.q_evals[point_index.0];
-
-            let point = srs.domain.rotate_omega(x_3, row);
-            eval = eval - &q_evals[point_index.0];
-            eval = eval * &(x_6 - &point).invert().unwrap();
-
-            msm_eval *= &x_5;
-            msm_eval += &eval;
+        for (set_idx, query_set) in srs.cs.query_sets.iter().enumerate() {
+            let mut eval = self.q_evals[set_idx];
+            for (query_idx, &row) in query_set.iter().enumerate() {
+                eval = eval - &q_eval_sets[set_idx][query_idx];
+                let point = srs.domain.rotate_omega(x_3, row);
+                eval = eval * &(x_6 - &point).invert().unwrap();
+                msm_eval *= &x_5;
+                msm_eval += &eval;
+            }
         }
 
         // Sample a challenge x_7 that we will use to collapse the openings of
@@ -281,11 +316,11 @@ impl<'a, C: CurveAffine> Proof<C> {
         // Compute the final commitment that has to be opened
         let mut commitment_msm = params.empty_msm();
         commitment_msm.add_term(C::Scalar::one(), self.f_commitment);
-        for (_, &point_index) in srs.cs.rotations.iter() {
+        for (set_idx, _) in srs.cs.query_sets.iter().enumerate() {
             commitment_msm.scale(x_7);
-            commitment_msm.add_msm(&q_commitments[point_index.0]);
+            commitment_msm.add_msm(&q_commitments[set_idx]);
             msm_eval *= &x_7;
-            msm_eval += &self.q_evals[point_index.0];
+            msm_eval += &self.q_evals[set_idx];
         }
 
         // Verify the opening proof
