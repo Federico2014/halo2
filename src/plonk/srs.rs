@@ -102,6 +102,10 @@ impl<C: CurveAffine> SRS<C> {
 
         let mut cs = ConstraintSystem::default();
         let config = ConcreteCircuit::configure(&mut cs);
+        cs.construct_advice_query_sets();
+        cs.construct_aux_query_sets();
+        cs.construct_fixed_query_sets();
+        cs.construct_query_sets();
 
         // Get the largest permutation argument length in terms of the number of
         // advice wires involved.

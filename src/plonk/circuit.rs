@@ -1,21 +1,21 @@
 use core::cmp::max;
 use core::ops::{Add, Mul};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::Error;
 use crate::arithmetic::Field;
 
 use crate::poly::Rotation;
 /// This represents a wire which has a fixed (permanent) value
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct FixedWire(pub usize);
 
 /// This represents a wire which has a witness-specific value
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct AdviceWire(pub usize);
 
 /// This represents a wire which has an externally assigned value
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct AuxWire(pub usize);
 
 /// This trait allows a [`Circuit`] to direct some backend to assign a witness
@@ -154,6 +154,11 @@ impl<F> Mul<F> for Expression<F> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct PointIndex(pub usize);
 
+/// Represents an index into a vector where each entry corresponds to a distinct
+/// set of points that polynomials are queried at.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SetIndex(pub usize);
+
 /// This is a description of the circuit environment, such as the gate, wire and
 /// permutation arrangements.
 #[derive(Debug, Clone)]
@@ -165,6 +170,18 @@ pub struct ConstraintSystem<F> {
     pub(crate) advice_queries: Vec<(AdviceWire, Rotation)>,
     pub(crate) aux_queries: Vec<(AuxWire, Rotation)>,
     pub(crate) fixed_queries: Vec<(FixedWire, Rotation)>,
+
+    // Mapping from a set of query points to the advice wires queried at that set
+    pub(crate) advice_query_sets: BTreeMap<BTreeSet<Rotation>, Vec<AdviceWire>>,
+
+    // Mapping from a set of query points to the auxiliary wires queried at that set
+    pub(crate) aux_query_sets: BTreeMap<BTreeSet<Rotation>, Vec<AuxWire>>,
+
+    // Mapping from a set of query points to the fixed wires queried at that set
+    pub(crate) fixed_query_sets: BTreeMap<BTreeSet<Rotation>, Vec<FixedWire>>,
+
+    // A vector of sets of query points at which commitments were opened
+    pub(crate) query_sets: Vec<BTreeSet<Rotation>>,
 
     // Mapping from a witness vector rotation to the index in the point vector.
     pub(crate) rotations: BTreeMap<Rotation, PointIndex>,
@@ -184,6 +201,10 @@ impl<F: Field> Default for ConstraintSystem<F> {
         let mut rotations = BTreeMap::new();
         rotations.insert(Rotation::default(), PointIndex(0));
 
+        let mut query_sets = Vec::new();
+        query_sets.push(default_query_set());
+        query_sets.push(inv_query_set());
+
         ConstraintSystem {
             num_fixed_wires: 0,
             num_advice_wires: 0,
@@ -192,6 +213,10 @@ impl<F: Field> Default for ConstraintSystem<F> {
             fixed_queries: Vec::new(),
             advice_queries: Vec::new(),
             aux_queries: Vec::new(),
+            fixed_query_sets: BTreeMap::new(),
+            advice_query_sets: BTreeMap::new(),
+            aux_query_sets: BTreeMap::new(),
+            query_sets,
             rotations,
             permutations: Vec::new(),
         }
@@ -237,9 +262,52 @@ impl<F: Field> ConstraintSystem<F> {
         index
     }
 
+    /// Get the index of an existing query in fixed_queries
+    pub fn query_existing_fixed_index(&self, wire: FixedWire, at: i32) -> Option<usize> {
+        let at = Rotation(at);
+
+        // Return existing query, if it exists
+        for (index, fixed_query) in self.fixed_queries.iter().enumerate() {
+            if fixed_query == &(wire, at) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
     /// Query a fixed wire at a relative position
     pub fn query_fixed(&mut self, wire: FixedWire, at: i32) -> Expression<F> {
         Expression::Fixed(self.query_fixed_index(wire, at))
+    }
+
+    /// Convert fixed_queries into a mapping from a unique set of points queried ->
+    /// the list of fixed wires queried at a set
+    pub fn construct_fixed_query_sets(&mut self) {
+        let mut tmp_map: BTreeMap<FixedWire, BTreeSet<Rotation>> = BTreeMap::new();
+        for (wire, at) in self.fixed_queries.iter() {
+            match tmp_map.get_mut(&wire) {
+                None => {
+                    tmp_map.insert(*wire, [*at].iter().cloned().collect());
+                }
+                Some(current) => {
+                    current.insert(*at);
+                }
+            }
+        }
+
+        let mut tmp_map_flipped: BTreeMap<BTreeSet<Rotation>, Vec<FixedWire>> = BTreeMap::new();
+        for (wire, query_set) in tmp_map.iter() {
+            match tmp_map_flipped.get_mut(&query_set) {
+                None => {
+                    tmp_map_flipped.insert(query_set.clone(), vec![*wire]);
+                }
+                Some(current) => {
+                    current.push(*wire);
+                }
+            }
+        }
+
+        self.fixed_query_sets = tmp_map_flipped;
     }
 
     fn query_advice_index(&mut self, wire: AdviceWire, at: i32) -> usize {
@@ -263,9 +331,52 @@ impl<F: Field> ConstraintSystem<F> {
         index
     }
 
+    /// Get the index of an existing query in advice_queries
+    pub fn query_existing_advice_index(&self, wire: AdviceWire, at: i32) -> Option<usize> {
+        let at = Rotation(at);
+
+        // Return existing query, if it exists
+        for (index, advice_query) in self.advice_queries.iter().enumerate() {
+            if advice_query == &(wire, at) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
     /// Query an advice wire at a relative position
     pub fn query_advice(&mut self, wire: AdviceWire, at: i32) -> Expression<F> {
         Expression::Advice(self.query_advice_index(wire, at))
+    }
+
+    /// Convert advice_queries into a mapping from a unique set of points queried ->
+    /// the list of advice wires queried at that set
+    pub fn construct_advice_query_sets(&mut self) {
+        let mut tmp_map: BTreeMap<AdviceWire, BTreeSet<Rotation>> = BTreeMap::new();
+        for (wire, at) in self.advice_queries.iter() {
+            match tmp_map.get_mut(&wire) {
+                None => {
+                    tmp_map.insert(*wire, [*at].iter().cloned().collect());
+                }
+                Some(current) => {
+                    current.insert(*at);
+                }
+            }
+        }
+
+        let mut tmp_map_flipped: BTreeMap<BTreeSet<Rotation>, Vec<AdviceWire>> = BTreeMap::new();
+        for (wire, query_set) in tmp_map.iter() {
+            match tmp_map_flipped.get_mut(&query_set) {
+                None => {
+                    tmp_map_flipped.insert(query_set.clone(), vec![*wire]);
+                }
+                Some(current) => {
+                    current.push(*wire);
+                }
+            }
+        }
+
+        self.advice_query_sets = tmp_map_flipped;
     }
 
     fn query_aux_index(&mut self, wire: AuxWire, at: i32) -> usize {
@@ -289,9 +400,70 @@ impl<F: Field> ConstraintSystem<F> {
         index
     }
 
+    /// Get the index of an existing query in aux_queries
+    pub fn query_existing_aux_index(&self, wire: AuxWire, at: i32) -> Option<usize> {
+        let at = Rotation(at);
+
+        // Return existing query, if it exists
+        for (index, aux_query) in self.aux_queries.iter().enumerate() {
+            if aux_query == &(wire, at) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
     /// Query an auxiliary wire at a relative position
     pub fn query_aux(&mut self, wire: AuxWire, at: i32) -> Expression<F> {
         Expression::Aux(self.query_aux_index(wire, at))
+    }
+
+    /// Convert aux_queries into a mapping from a unique set of points queried ->
+    /// the list of aux wires queried at that set
+    pub fn construct_aux_query_sets(&mut self) {
+        let mut tmp_map: BTreeMap<AuxWire, BTreeSet<Rotation>> = BTreeMap::new();
+        for (wire, at) in self.aux_queries.iter() {
+            match tmp_map.get_mut(&wire) {
+                None => {
+                    tmp_map.insert(*wire, [*at].iter().cloned().collect());
+                }
+                Some(current) => {
+                    current.insert(*at);
+                }
+            }
+        }
+
+        let mut tmp_map_flipped: BTreeMap<BTreeSet<Rotation>, Vec<AuxWire>> = BTreeMap::new();
+        for (wire, query_set) in tmp_map.iter() {
+            match tmp_map_flipped.get_mut(&query_set) {
+                None => {
+                    tmp_map_flipped.insert(query_set.clone(), vec![*wire]);
+                }
+                Some(current) => {
+                    current.push(*wire);
+                }
+            }
+        }
+
+        self.aux_query_sets = tmp_map_flipped;
+    }
+
+    /// Construct vector of unique query_sets
+    pub fn construct_query_sets(&mut self) {
+        let mut tmp_query_sets: BTreeSet<BTreeSet<Rotation>> = BTreeSet::new();
+        for query_set in self.query_sets.clone() {
+            tmp_query_sets.insert(query_set);
+        }
+        for (query_set, _) in self.advice_query_sets.clone() {
+            tmp_query_sets.insert(query_set);
+        }
+        for (query_set, _) in self.aux_query_sets.clone() {
+            tmp_query_sets.insert(query_set);
+        }
+        for (query_set, _) in self.fixed_query_sets.clone() {
+            tmp_query_sets.insert(query_set);
+        }
+        self.query_sets = tmp_query_sets.into_iter().collect();
     }
 
     /// Create a new gate
@@ -320,4 +492,18 @@ impl<F: Field> ConstraintSystem<F> {
         self.num_aux_wires += 1;
         tmp
     }
+}
+
+/// Query set containing just the query at Rotation(0)
+pub fn default_query_set() -> BTreeSet<Rotation> {
+    let mut default_query_set = BTreeSet::new();
+    default_query_set.insert(Rotation::default());
+    default_query_set
+}
+
+/// Query set containing just the query at Rotation(-1)
+pub fn inv_query_set() -> BTreeSet<Rotation> {
+    let mut inv_query_set = BTreeSet::new();
+    inv_query_set.insert(Rotation(-1));
+    inv_query_set
 }
